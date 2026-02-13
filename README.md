@@ -1,56 +1,31 @@
-# Allay Java Plugin Template
+# RockArchive
 
-Welcome to the java plugin template for allay.
+RockArchive is a high-performance world storage plugin for [AllayMC](https://github.com/AllayMC/Allay) powered by [RocksDB](https://rocksdb.org/).
 
-## Prerequisites
+It replaces traditional LevelDB-based world storage with a modern, highly configurable backend that offers improved compression efficiency, better
+write concurrency, and scalable compaction strategies for large-scale servers.
 
-- Java21 or higher.
-- Allay installed.
+## Features
 
-## Getting Started
+- **ZSTD Compression** — Uses ZSTD for both regular and bottommost-level compaction, delivering better compression ratios than LevelDB's default Snappy/Zlib.
+- **Bloom Filter** — 10-bit Bloom filter on data blocks to speed up point lookups (`containChunk`, entity reads, etc.).
+- **Concurrent Background Jobs** — Automatically scales background flush/compaction threads to half the available CPU cores.
+- **Drop-in Replacement** — Registers as a `ROCKSDB` world storage factory; just set the storage type in your world configuration.
 
-1. **Clone this Repository**
+## Installation
 
-```bash
-git clone https://github.com/AllayMC/JavaPluginTemplate.git
-```
-   
-2. **Navigate to the Cloned Directory**
+1. Download the latest release JAR from [Releases](https://github.com/AllayMC/RockArchive/releases).
+2. Place the JAR in your AllayMC server's `plugins/` directory.
+3. Edit `worlds/world-settings.yml`, set `storage-type` to `ROCKSDB`:
 
-```bash
-cd JavaPluginTemplate
-```
-   
-3. **Change Plugin Information**
-
-- Rename package name from `org.allaymc.javaplugintemplate` to `your.group.name.and.pluginname`
-- Update [build.gradle.kts](build.gradle.kts) and [settings.gradle.kts](settings.gradle.kts)
-- Reload gradle
-   
-4. **Build and Run Your Plugin**
-
-```bash
-gradlew shadowJar
-```
-   
-This command will produce a `.jar` file in the `build/libs` directory. 
-Copy the `.jar` file to the `plugins` directory of your allay server.
-Start the allay server and check the logs to ensure your plugin loads and operates
-as expected.
-
-5. **Test Your Plugin in Gradle**
-
-```bash
-gradlew runServer
+```yaml
+worlds:
+  world:
+    storage-type: ROCKSDB
 ```
 
-This command will start an allay server with your plugin loaded.
-Then close allay server by clicking `X` in the dashboard window.
-
-## Documentation
-
-For a deeper dive into the Allay API and its functionalities, please refer to our [documentation](https://docs.allaymc.org) (WIP).
+4. Restart the server.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
