@@ -23,11 +23,7 @@ import org.allaymc.server.world.AllayWorldData;
 import org.allaymc.server.world.chunk.AllayChunkSection;
 import org.allaymc.server.world.chunk.AllayUnsafeChunk;
 import org.allaymc.server.world.storage.leveldb.LevelDBUtils;
-import org.allaymc.server.world.storage.leveldb.codec.BlockEntityCodec;
-import org.allaymc.server.world.storage.leveldb.codec.ChunkSectionCodec;
-import org.allaymc.server.world.storage.leveldb.codec.HeightAndBiomeCodec;
-import org.allaymc.server.world.storage.leveldb.codec.ScheduledUpdateCodec;
-import org.allaymc.server.world.storage.leveldb.codec.WorldDataCodec;
+import org.allaymc.server.world.storage.leveldb.codec.*;
 import org.allaymc.server.world.storage.leveldb.data.ChunkVersion;
 import org.allaymc.server.world.storage.leveldb.data.LevelDBKey;
 import org.allaymc.server.world.storage.leveldb.data.VanillaChunkState;
@@ -41,9 +37,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * RocksDB implementation of {@link WorldStorage} which replaces LevelDB usage with RocksDB (rocksdbjni).
@@ -58,7 +59,7 @@ public class RocksDBWorldStorage implements WorldStorage {
 
     private static final String DIR_DB = "db";
 
-    private static final int CURRENT_CHUNK_VERSION = ChunkVersion.V1_21_40.ordinal();
+    private static final int CURRENT_CHUNK_VERSION = ChunkVersion.V1_21_120.ordinal();
 
     private final Path path;
     private final String worldName;
@@ -66,6 +67,14 @@ public class RocksDBWorldStorage implements WorldStorage {
     // RocksDB objects
     private final RocksDB db;
     private final Options options;
+
+    private final Queue<Chunk> batchChunks;
+    // Map keyed by (chunkX, chunkZ, dimensionId) so duplicate writes for the same chunk
+    // are deduplicated: the last writing wins, preventing orphaned entity NBT in RocksDB.
+    private final Map<EntityWriteKey, EntityWriteRequest> batchEntityRequests;
+    // Guards batchMode, batchChunks, and batchEntityRequests to make check-then-enqueue atomic.
+    private final Lock batchLock;
+    private boolean batchMode;
 
     private World world;
 
@@ -105,6 +114,11 @@ public class RocksDBWorldStorage implements WorldStorage {
         } catch (RocksDBException e) {
             throw new WorldStorageException(e);
         }
+
+        this.batchChunks = new ArrayDeque<>();
+        this.batchEntityRequests = new LinkedHashMap<>();
+        this.batchLock = new ReentrantLock();
+        this.batchMode = false;
     }
 
     @Override
@@ -196,11 +210,61 @@ public class RocksDBWorldStorage implements WorldStorage {
             builder.scheduledUpdates(ScheduledUpdateCodec.deserialize(scheduledBytes));
         }
 
+        // POI data
+        var poiBytes = db.get(LevelDBKey.ALLAY_POI_DATA.createKey(chunkX, chunkZ, dimensionInfo));
+        if (poiBytes != null) {
+            builder.poiEntries(PoiCodec.deserialize(poiBytes));
+        }
+
         return builder.build().toSafeChunk();
     }
 
     @Override
+    public void startBatchWrite() {
+        batchLock.lock();
+        try {
+            batchMode = true;
+        } finally {
+            batchLock.unlock();
+        }
+    }
+
+    @Override
+    public void flushBatchWrite() {
+        batchLock.lock();
+        try {
+            batchMode = false;
+            if (batchChunks.isEmpty() && batchEntityRequests.isEmpty()) return;
+            try (var writeBatch = new WriteBatch();
+                 var writeOptions = new WriteOptions()) {
+                Chunk chunk;
+                while ((chunk = batchChunks.poll()) != null) {
+                    addChunkToBatch(chunk, writeBatch);
+                }
+                for (var req : batchEntityRequests.values()) {
+                    addEntitiesToBatch(req.chunkX(), req.chunkZ(), req.dimensionInfo(), req.entities(), writeBatch);
+                }
+                batchEntityRequests.clear();
+                db.write(writeOptions, writeBatch);
+            } catch (RocksDBException e) {
+                throw new WorldStorageException(e);
+            }
+        } finally {
+            batchLock.unlock();
+        }
+    }
+
+    @Override
     public CompletableFuture<Void> writeChunk(Chunk chunk) {
+        batchLock.lock();
+        try {
+            if (batchMode) {
+                batchChunks.offer(chunk);
+                return CompletableFuture.completedFuture(null);
+            }
+        } finally {
+            batchLock.unlock();
+        }
         return CompletableFuture
                 .runAsync(() -> writeChunkSync(chunk), Server.getInstance().getVirtualThreadPool())
                 .exceptionally(t -> {
@@ -213,28 +277,7 @@ public class RocksDBWorldStorage implements WorldStorage {
     public void writeChunkSync(Chunk chunk) {
         try (var writeBatch = new WriteBatch();
              var writeOptions = new WriteOptions()) {
-
-            // Version
-            writeBatch.put(
-                    LevelDBKey.VERSION.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
-                    new byte[]{(byte) CURRENT_CHUNK_VERSION}
-            );
-
-            // finalized state
-            writeBatch.put(
-                    LevelDBKey.CHUNK_FINALIZED_STATE.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
-                    LevelDBUtils.withByteBufToArray(buf -> buf.writeByte(VanillaChunkState.DONE.ordinal()))
-            );
-
-            // chunk state
-            writeBatch.put(
-                    LevelDBKey.ALLAY_CHUNK_STATE.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
-                    chunk.getState().name().getBytes()
-            );
-
-            chunk.applyOperation(c -> writeChunk0((AllayUnsafeChunk) c, writeBatch), OperationType.READ, OperationType.READ);
-
-            // write to DB
+            addChunkToBatch(chunk, writeBatch);
             db.write(writeOptions, writeBatch);
         } catch (RocksDBException e) {
             throw new WorldStorageException(e);
@@ -242,7 +285,24 @@ public class RocksDBWorldStorage implements WorldStorage {
     }
 
     @SneakyThrows
-    protected void writeChunk0(AllayUnsafeChunk chunk, WriteBatch writeBatch) {
+    private void addChunkToBatch(Chunk chunk, WriteBatch writeBatch) {
+        writeBatch.put(
+                LevelDBKey.VERSION.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
+                new byte[]{(byte) CURRENT_CHUNK_VERSION}
+        );
+        writeBatch.put(
+                LevelDBKey.CHUNK_FINALIZED_STATE.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
+                LevelDBUtils.withByteBufToArray(buf -> buf.writeByte(VanillaChunkState.DONE.ordinal()))
+        );
+        writeBatch.put(
+                LevelDBKey.ALLAY_CHUNK_STATE.createKey(chunk.getX(), chunk.getZ(), chunk.getDimensionInfo()),
+                chunk.getState().name().getBytes()
+        );
+        chunk.applyOperation(c -> writeChunkInner((AllayUnsafeChunk) c, writeBatch), OperationType.READ, OperationType.READ);
+    }
+
+    @SneakyThrows
+    private void writeChunkInner(AllayUnsafeChunk chunk, WriteBatch writeBatch) {
         var dimensionInfo = chunk.getDimensionInfo();
 
         // Sections
@@ -279,6 +339,59 @@ public class RocksDBWorldStorage implements WorldStorage {
             writeBatch.delete(scheduledKey);
         } else {
             writeBatch.put(scheduledKey, scheduledData);
+        }
+
+        // POI data
+        var poiKey = LevelDBKey.ALLAY_POI_DATA.createKey(chunk.getX(), chunk.getZ(), dimensionInfo);
+        var poiData = PoiCodec.serialize(chunk.getPoiEntries());
+        if (poiData == null) {
+            writeBatch.delete(poiKey);
+        } else {
+            writeBatch.put(poiKey, poiData);
+        }
+    }
+
+    @Override
+    public void writeEntitiesSync(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities) {
+        batchLock.lock();
+        try {
+            if (batchMode) {
+                batchEntityRequests.put(
+                        new EntityWriteKey(chunkX, chunkZ, dimensionInfo.dimensionId()),
+                        new EntityWriteRequest(chunkX, chunkZ, dimensionInfo, entities)
+                );
+                return;
+            }
+        } finally {
+            batchLock.unlock();
+        }
+        writeEntities0(chunkX, chunkZ, dimensionInfo, entities, false);
+    }
+
+    @SneakyThrows
+    private void addEntitiesToBatch(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities, WriteBatch writeBatch) {
+        var idsBuf = ByteBufAllocator.DEFAULT.buffer();
+        try {
+            var idsKey = LevelDBKey.createEntityIdsKey(chunkX, chunkZ, dimensionInfo);
+
+            // Delete old entity data for this chunk
+            var oldIds = db.get(idsKey);
+            if (oldIds != null) {
+                var oldIdsBuf = Unpooled.wrappedBuffer(oldIds);
+                for (int i = 0; i < oldIds.length; i += Long.BYTES) {
+                    writeBatch.delete(LevelDBKey.indexEntity(oldIdsBuf.readLongLE()));
+                }
+            }
+
+            // Write new entities
+            for (var entry : entities.entrySet()) {
+                idsBuf.writeLongLE(entry.getKey());
+                writeBatch.put(LevelDBKey.indexEntity(entry.getKey()), AllayNBTUtils.nbtToBytesLE(entry.getValue().saveNBT()));
+            }
+
+            writeBatch.put(idsKey, ByteBufUtil.getBytes(idsBuf));
+        } finally {
+            idsBuf.release();
         }
     }
 
@@ -347,11 +460,6 @@ public class RocksDBWorldStorage implements WorldStorage {
     @Override
     public CompletableFuture<Void> writeEntities(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities) {
         return writeEntities0(chunkX, chunkZ, dimensionInfo, entities, true);
-    }
-
-    @Override
-    public void writeEntitiesSync(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities) {
-        writeEntities0(chunkX, chunkZ, dimensionInfo, entities, false);
     }
 
     protected CompletableFuture<Void> writeEntities0(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities, boolean asyncWrite) {
@@ -502,4 +610,8 @@ public class RocksDBWorldStorage implements WorldStorage {
         db.close();
         options.close();
     }
+
+    private record EntityWriteKey(int chunkX, int chunkZ, int dimensionId) {}
+
+    private record EntityWriteRequest(int chunkX, int chunkZ, DimensionInfo dimensionInfo, Map<Long, Entity> entities) {}
 }

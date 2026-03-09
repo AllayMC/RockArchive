@@ -5,7 +5,7 @@ plugins {
 
 group = "org.allaymc.rockarchive"
 description = "RockArchive is a high-performance world storage format for AllayMC powered by RocksDB"
-version = "0.1.0"
+version = "0.2.0"
 
 java {
     toolchain {
@@ -14,7 +14,7 @@ java {
 }
 
 allay {
-    api = "0.25.0"
+    api = "0.26.0"
     apiOnly = false
 
     plugin {
